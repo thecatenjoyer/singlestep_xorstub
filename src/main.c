@@ -1,5 +1,7 @@
 #include <Windows.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 // for generating random numbers
@@ -27,7 +29,8 @@ char xored_shellcode[]
 
 static uintptr_t stub = 0;
 static uintptr_t stub_end = 0;
-static uintptr_t last_ip = 0;
+static uintptr_t last_ip = -1;
+static bool is_page_guarded = 0;
 static char *xor_block = 0;
 
 void
@@ -46,31 +49,8 @@ handler (EXCEPTION_POINTERS *exception)
 
     switch (exception->ExceptionRecord->ExceptionCode)
         {
-        case STATUS_ACCESS_VIOLATION:
-            if (CURRENT_IP (exception) == 0x1337)
-                {
-                    // begin singlestep stub
-                    CURRENT_IP (exception) = stub;
-                    exception->ContextRecord->EFlags |= TRAP_FLAG;
-
-                    // first opcode decryption
-                    xor_blocks (xor_block, (char *)stub,
-                                min (15, stub_end - CURRENT_IP (exception)));
-
-                    last_ip = CURRENT_IP (exception);
-
-                    // generate new xor key for current opcode
-                    newkey[0] = next ();
-                    newkey[1] = next ();
-
-                    // move new keys to xorkey block
-                    memcpy (&xor_block[last_ip - stub], newkey,
-                            min (15, stub_end - last_ip));
-
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-            break;
         case STATUS_SINGLE_STEP:
+            stub_procedure:
             if (last_ip >= stub && last_ip < stub_end)
                 {
                     // we just executed a opcode inside the stub, so xor it again with current key
@@ -97,6 +77,16 @@ handler (EXCEPTION_POINTERS *exception)
                     // move new keys to xorkey block
                     memcpy (&xor_block[last_ip - stub], newkey,
                             min (15, stub_end - CURRENT_IP (exception)));
+
+                    if (true == is_page_guarded
+                        && EXCEPTION_GUARD_PAGE
+                               != exception->ExceptionRecord->ExceptionCode)
+                        {
+                            DWORD old;
+                            VirtualProtect (
+                                (LPVOID)stub, stub_end - stub,
+                                PAGE_EXECUTE_READWRITE | PAGE_GUARD, &old);
+                        }
                 }
             else
                 {
@@ -105,14 +95,24 @@ handler (EXCEPTION_POINTERS *exception)
                 }
 
             return EXCEPTION_CONTINUE_EXECUTION;
+        case STATUS_ACCESS_VIOLATION:
+            if (CURRENT_IP (exception) == 0x1337)
+                {
+                    // begin singlestep stub
+                    CURRENT_IP (exception) = stub;
+                    goto stub_procedure;
+                }
+            break;
+        case EXCEPTION_GUARD_PAGE:
+            if (CURRENT_IP (exception) >= stub
+                && CURRENT_IP (exception) < stub_end)
+                {
+                    goto stub_procedure;
+                }
+            break;
         default:
             return EXCEPTION_CONTINUE_SEARCH;
         
-        }
-
-    if (exception->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP)
-        {
-            return EXCEPTION_CONTINUE_EXECUTION;
         }
 
     return EXCEPTION_CONTINUE_SEARCH;
@@ -122,14 +122,22 @@ int
 main (int argc, char **argv)
 {
     PVOID exception_handler;
+
     uint64_t seeds[4]
         = { 0x12391818181, 0x83838102810, 0x8318041e801, 0xe81038013810 };
+    DWORD old;
 
     stub = (uintptr_t)VirtualAlloc (NULL, STUB_SIZE, MEM_COMMIT,
-                                    PAGE_EXECUTE_READWRITE);
+                                    PAGE_READWRITE);
+
+    is_page_guarded = true;
     stub_end = stub + STUB_SIZE;
 
     memcpy ((void *)stub, xored_shellcode, sizeof (xored_shellcode) - 1);
+
+    // activate PAGE_GUARD after we finished setting it up.
+    VirtualProtect ((LPVOID)stub, stub_end - stub,
+                    PAGE_EXECUTE_READWRITE | PAGE_GUARD, &old);
 
     // register exception handler for catching singlesteps and exceptions
     exception_handler = AddVectoredExceptionHandler (1, &handler);
@@ -145,6 +153,6 @@ main (int argc, char **argv)
             ((uint64_t *)xor_block)[i] = next ();
         }
 
-    // throw exception
-    return ((int (*) (void))0x1337) ();
+    // throw exception on PAGE_GUARD access
+    return ((int (*) (void))stub) (); 
 }
